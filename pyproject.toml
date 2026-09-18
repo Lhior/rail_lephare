@@ -20,6 +20,10 @@ dependencies = ["lephare>=0.3.0", "pz-rail-base>=2.0.0-dev", "qp-prob"]
 
 # On a mac, install optional dependencies with `pip install '.[dev]'` (include the single quotes)
 [project.optional-dependencies]
+# GPU/JAX backends from lephare.accel (needs a lephare release that ships it)
+jax = ["lephare[jax]"]
+cuda = ["lephare[cuda]"]
+accel = ["lephare[accel]"]
 dev = [
     "pytest",
     "pytest-cov", # Used to report total code coverage

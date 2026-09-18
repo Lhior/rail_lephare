@@ -84,6 +84,30 @@ qso_default_config = dict(
 )
 
 
+ACCEL_BACKENDS = ("jax_hybrid", "cuda_hybrid", "jax_full", "cuda_full")
+
+
+def _backend_params() -> dict[str, Param]:
+    """Config options selecting the compute backend (see ``lephare.accel``)."""
+    return dict(
+        backend=Param(
+            str,
+            "lephare",
+            msg=(
+                "Compute backend: 'lephare' (C++ default), or one of "
+                f"{', '.join(ACCEL_BACKENDS)} from lephare.accel. '*_hybrid' "
+                "builds the template library with C++ and fits on JAX/CUDA; "
+                "'*_full' also builds the library on the GPU."
+            ),
+        ),
+        dtype=Param(
+            str,
+            "float64",
+            msg="Floating dtype for accelerated backends (float32 is faster, float64 matches C++).",
+        ),
+    )
+
+
 def _add_sub_config(
     config: dict[str, Any],
     sub_config: dict[str, Any],
@@ -129,6 +153,7 @@ class LephareInformer(CatInformer):
         err_bands=SHARED_PARAMS,
         ref_band=SHARED_PARAMS,
         redshift_col=SHARED_PARAMS,
+        **_backend_params(),
     )
     _add_sub_config(config_options, lsst_default_config, "lephare.")
     _add_sub_config(config_options, star_default_config, "star.")
@@ -140,6 +165,11 @@ class LephareInformer(CatInformer):
         super().__init__(args, **kwargs)
 
     def validate(self):
+        if self.config["backend"] not in ("lephare",) + ACCEL_BACKENDS:
+            raise ValueError(
+                f"Unknown backend {self.config['backend']!r}; "
+                f"choose 'lephare' or one of {ACCEL_BACKENDS}"
+            )
         # Put something in place to allow for not rerunning the prepare stage
         try:
             self.do_prepare = self.config["do_prepare"]
@@ -197,14 +227,25 @@ class LephareInformer(CatInformer):
         gal_config = _get_sub_config(self.config, "gal.")
         qso_config = _get_sub_config(self.config, "qso.")
 
+        backend = self.config["backend"]
+        tensors = None
+        maglib_path = None
         # The three main lephare specific inform tasks
-        if self.do_prepare:
+        if self.do_prepare and backend == "lephare":
             lp.prepare(
                 self.lephare_config,
                 star_config=star_config,
                 gal_config=gal_config,
                 qso_config=qso_config,
             )
+        elif self.do_prepare:
+            from lephare.accel.maglib import save_maglib
+
+            tensors = _build_maglib(
+                backend, self.lephare_config, star_config, gal_config, qso_config
+            )
+            maglib_path = os.path.join(self.run_dir, "maglib_tensors.npz")
+            save_maglib(tensors, maglib_path)
         else:
             self.log.info(
                 f"do_prepare set to False, using precomputed files in {self.run_dir}."
@@ -217,8 +258,21 @@ class LephareInformer(CatInformer):
         input_table = _rail_to_lephare_input(
             training_data, self.config.bands, self.config.err_bands
         )
-        # This will return zeros if AUTO_ADAPT is NO
-        offsets = lp.calculate_offsets_from_input(self.lephare_config, input_table)
+        if backend in ("jax_full", "cuda_hybrid", "cuda_full"):
+            # jax_full has no C++ magnitude library to adapt against
+            offsets = _accel_offsets(
+                backend,
+                self.lephare_config,
+                training_data,
+                self.config.bands,
+                self.config.err_bands,
+                self.config.redshift_col,
+                tensors,
+                self.run_dir,
+            )
+        else:
+            # This will return zeros if AUTO_ADAPT is NO
+            offsets = lp.calculate_offsets_from_input(self.lephare_config, input_table)
         # Give principle inform config 'model' to instance.
         self.model = dict(
             lephare_version=lp.__version__,
@@ -228,6 +282,9 @@ class LephareInformer(CatInformer):
             star_config=star_config,
             gal_config=gal_config,
             qso_config=qso_config,
+            backend=backend,
+            maglib_path=maglib_path,
+            dtype=self.config["dtype"],
         )
         self.add_data("model", self.model)
 
@@ -302,6 +359,7 @@ class LephareEstimator(CatEstimator):
             False,
             msg="Whether to write the output files.",
         ),
+        **_backend_params(),
     )
     _add_sub_config(config_options, lsst_default_config, "lephare.")
 
@@ -311,6 +369,34 @@ class LephareEstimator(CatEstimator):
         self.zmin: float | None = None
         self.zmax: float | None = None
         self.nzbins: int | None = None
+        self._tensors = None
+
+    def _resolved_backend(self) -> str:
+        """The configured backend, or the informer's when left at 'lephare'."""
+        backend = self.config["backend"]
+        if backend == "lephare" and isinstance(self.model, dict):
+            if self.model.get("backend") in ACCEL_BACKENDS:
+                return self.model["backend"]
+        return backend
+
+    def run(self) -> None:
+        """Estimate loop. Accel backends skip the per-chunk ``gc.collect`` (it stalls the GPU)."""
+        if self.config["backend"] == "lephare":
+            super().run()
+            return
+
+        self.open_model(**self.config)
+        iterator = self.input_iterator("input")
+        first = True
+        self._initialize_run()
+        self._output_handle = None
+        for s, e, test_data in iterator:
+            self.log.info(
+                f"Process {self.rank} running estimator on chunk {s:,} - {e:,}"
+            )
+            self._process_chunk(s, e, test_data, first)
+            first = False
+        self._finalize_run()
 
     def open_model(self, **kwargs):
         CatEstimator.open_model(self, **kwargs)
@@ -318,6 +404,10 @@ class LephareEstimator(CatEstimator):
             self.lephare_config = self.model["lephare_config"]
         else:
             self.lephare_config = _get_sub_config(self.config, "lephare.")
+        # String values, in case a keymap was passed to the estimate stage
+        self.lephare_config = lp.keymap_to_string_dict(
+            lp.all_types_to_keymap(self.lephare_config)
+        )
 
         Z_STEP = self.model["lephare_config"]["Z_STEP"]
         self.lephare_config["Z_STEP"] = Z_STEP
@@ -336,6 +426,9 @@ class LephareEstimator(CatEstimator):
 
         Run the equivalent of zphota and get the PDF for every source.
         """
+        if self._resolved_backend() != "lephare":
+            self._process_chunk_accel(start, end, data, first)
+            return
         # Create the lephare input table
         input_table = _rail_to_lephare_input(
             data, self.config.bands, self.config.err_bands
@@ -380,6 +473,70 @@ class LephareEstimator(CatEstimator):
             ancil[c] = np.array(output[c])
         qp_dstn.set_ancil(ancil)
         self._do_chunk_output(qp_dstn, start, end, first, data=data)
+
+    def _process_chunk_accel(self, start, end, data, first):
+        """Process a chunk with a ``lephare.accel`` backend (BAY_ZG posterior only)."""
+        from lephare.accel.dispatch import process_with_backend
+        from lephare.accel.kernels_ref import pdf_zmode_zmean
+
+        dtype_name = self.config["dtype"]
+        if dtype_name == "float64" and self.model.get("dtype"):
+            dtype_name = self.model["dtype"]
+        offsets = None
+        if self.config["use_inform_offsets"] and self.model["offsets"] is not None:
+            offsets = np.asarray(self.model["offsets"], dtype=np.float64)
+
+        mags = np.column_stack(
+            [np.asarray(data[b], dtype=np.float64) for b in self.config.bands]
+        )
+        magerrs = np.column_stack(
+            [np.asarray(data[b], dtype=np.float64) for b in self.config.err_bands]
+        )
+        result = process_with_backend(
+            self._resolved_backend(),
+            mags,
+            magerrs,
+            self._accel_tensors(),
+            context=data["context"] if "context" in data else None,
+            offsets=offsets,
+            dtype=np.float64 if dtype_name == "float64" else np.float32,
+        )
+        # Backends return (pdfs, zgrid[, zmode, zmean[, ancil]])
+        pdfs, zgrid = result[0], result[1]
+        if len(result) >= 4:
+            zmode, zmean = result[2], result[3]
+        else:
+            zmode, zmean = pdf_zmode_zmean(pdfs, zgrid)
+        backend_ancil = result[4] if len(result) == 5 else {}
+        self.zgrid = zgrid
+
+        ng = mags.shape[0]
+        ancil = dict(zmode=zmode, zmean=zmean)
+        for c in self.config["output_keys"]:
+            if c in backend_ancil:
+                ancil[c] = np.asarray(backend_ancil[c], dtype=np.float64)
+            else:
+                ancil[c] = np.full(ng, np.nan)
+        # PDFs are already normalized on the device
+        qp_dstn = qp.Ensemble(
+            qp.interp,
+            data=dict(xvals=zgrid, yvals=np.asarray(pdfs), norm=False, warn=False),
+        )
+        qp_dstn.set_ancil(ancil)
+        self._do_chunk_output(qp_dstn, start, end, first, data=data)
+
+    def _accel_tensors(self):
+        """Template tensors saved by the informer, or rebuilt from the C++ library."""
+        if self._tensors is None:
+            from lephare.accel.mag_builder import build_maglib_from_prepare
+            from lephare.accel.maglib import load_maglib
+
+            maglib_path = self.model.get("maglib_path")
+            if maglib_path and os.path.isfile(maglib_path):
+                self._tensors = load_maglib(maglib_path)
+            else:
+                self._tensors = build_maglib_from_prepare(self.lephare_config)
+        return self._tensors
 
 
 def _rail_to_lephare_input(data, mag_cols, mag_err_cols):
@@ -431,6 +588,80 @@ def _rail_to_lephare_input(data, mag_cols, mag_err_cols):
         input_table["zspec"] = np.full(ng, -99.0)
     input_table["string_data"] = " "
     return input_table
+
+
+def _build_maglib(backend, lephare_config, star_config, gal_config, qso_config):
+    """Build the template tensors for an accel backend.
+
+    ``*_hybrid`` and ``cuda_full`` run the classic ``lp.prepare`` first;
+    ``cuda_full`` then recomputes the magnitudes on the GPU and checks them
+    against C++. ``jax_full`` computes the magnitudes with JAX only.
+    """
+    sub_configs = dict(
+        star_config=star_config, gal_config=gal_config, qso_config=qso_config
+    )
+    if backend == "jax_full":
+        from lephare.accel.jax_maggal import build_maglib_jax_from_lib_bin
+
+        return build_maglib_jax_from_lib_bin(
+            lephare_config, integrator="jax", **sub_configs
+        )
+
+    from lephare.accel.mag_builder import (
+        assert_maglib_parity,
+        build_maglib_from_prepare,
+        rebuild_maglib_cuda,
+    )
+
+    tensors = build_maglib_from_prepare(lephare_config, **sub_configs)
+    if backend == "cuda_full":
+        rebuilt = rebuild_maglib_cuda(tensors, config=lephare_config)
+        assert_maglib_parity(tensors, rebuilt)
+        tensors = rebuilt
+    return tensors
+
+
+def _accel_offsets(
+    backend,
+    lephare_config,
+    training_data,
+    mag_cols,
+    mag_err_cols,
+    redshift_col,
+    tensors,
+    run_dir,
+):
+    """AUTO_ADAPT zero-point offsets on the accel template tensors (C++ parity)."""
+    from lephare.accel.autoadapt import calculate_offsets
+    from lephare.accel.maglib import export_maglib_from_photoz, load_maglib
+
+    if tensors is None:
+        path = os.path.join(run_dir, "maglib_tensors.npz")
+        if os.path.isfile(path):
+            tensors = load_maglib(path)
+        else:
+            photz = lp.PhotoZ(lp.all_types_to_keymap(lephare_config))
+            tensors = export_maglib_from_photoz(photz, lephare_config)
+
+    mags = np.column_stack(
+        [np.asarray(training_data[c], dtype=np.float64) for c in mag_cols]
+    )
+    magerrs = np.column_stack(
+        [np.asarray(training_data[c], dtype=np.float64) for c in mag_err_cols]
+    )
+    zs = np.asarray(training_data[redshift_col], dtype=np.float64)
+    context = training_data["context"] if "context" in training_data else None
+    args = (mags, magerrs, zs, tensors, lephare_config)
+    if backend.startswith("cuda"):
+        try:
+            from lephare.accel.cuda_autoadapt import calculate_offsets_cuda
+
+            return np.asarray(
+                calculate_offsets_cuda(*args, context=context, verbose=False)
+            )
+        except ImportError:
+            pass
+    return np.asarray(calculate_offsets(*args, context=context, verbose=False))
 
 
 def _update_lephare_env(lepharedir, lepharework):
