@@ -342,7 +342,12 @@ class LephareEstimator(CatEstimator):
                 "The output keys to add to ancil. These must be in the "
                 "output para file. By default we include the best galaxy "
                 "and QSO redshift and best star alongside their respective "
-                "chi squared."
+                "chi squared. Accelerated backends also support the galaxy "
+                "properties MOD_BEST, SCALE_BEST, {MASS,SFR,SSFR,LDUST,AGE}_BEST, "
+                "EBV_BEST, EXTLAW_BEST, LUM_{NUV,R,K}_BEST, "
+                "{MASS,SFR,SSFR,LDUST,AGE,COL1,COL2,MREF}_{MED,INF,SUP} and "
+                "MAG_ABS(), EMAG_ABS(), K_COR(), MABS_FILT(), MAG_MOD() "
+                "(per-band 2D arrays); other keys are NaN."
             ),
         ),
         run_dir=Param(
@@ -492,14 +497,18 @@ class LephareEstimator(CatEstimator):
         magerrs = np.column_stack(
             [np.asarray(data[b], dtype=np.float64) for b in self.config.err_bands]
         )
+        backend = self._resolved_backend()
+        tensors = self._accel_tensors()
+        context = data["context"] if "context" in data else None
+        np_dtype = np.float64 if dtype_name == "float64" else np.float32
         result = process_with_backend(
-            self._resolved_backend(),
+            backend,
             mags,
             magerrs,
-            self._accel_tensors(),
-            context=data["context"] if "context" in data else None,
+            tensors,
+            context=context,
             offsets=offsets,
-            dtype=np.float64 if dtype_name == "float64" else np.float32,
+            dtype=np_dtype,
         )
         # Backends return (pdfs, zgrid[, zmode, zmean[, ancil]])
         pdfs, zgrid = result[0], result[1]
@@ -508,12 +517,32 @@ class LephareEstimator(CatEstimator):
         else:
             zmode, zmean = pdf_zmode_zmean(pdfs, zgrid)
         backend_ancil = result[4] if len(result) == 5 else {}
+        output_keys = list(self.config["output_keys"])
+        if backend_ancil:
+            from lephare.accel.physical import galaxy_properties
+
+            # Galaxy properties (masses, SFRs, absolute magnitudes, ...) from the best fit
+            backend_ancil = dict(backend_ancil)
+            backend_ancil.update(
+                galaxy_properties(
+                    output_keys,
+                    mags,
+                    magerrs,
+                    tensors,
+                    backend_ancil,
+                    self.lephare_config,
+                    context=context,
+                    offsets=offsets,
+                    backend=backend,
+                    dtype=np_dtype,
+                )
+            )
         self.zgrid = zgrid
 
         ng = mags.shape[0]
         ancil = dict(zmode=zmode, zmean=zmean)
-        for c in self.config["output_keys"]:
-            if c in backend_ancil:
+        for c in output_keys:
+            if c in backend_ancil and not c.startswith("_"):
                 ancil[c] = np.asarray(backend_ancil[c], dtype=np.float64)
             else:
                 ancil[c] = np.full(ng, np.nan)
