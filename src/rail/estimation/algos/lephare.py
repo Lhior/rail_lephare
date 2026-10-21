@@ -405,6 +405,7 @@ class LephareEstimator(CatEstimator):
 
     def open_model(self, **kwargs):
         CatEstimator.open_model(self, **kwargs)
+        self._tensors = None
         if self.config["lephare_config_from_model"]:
             self.lephare_config = self.model["lephare_config"]
         else:
@@ -555,17 +556,37 @@ class LephareEstimator(CatEstimator):
         self._do_chunk_output(qp_dstn, start, end, first, data=data)
 
     def _accel_tensors(self):
-        """Template tensors saved by the informer, or rebuilt from the C++ library."""
+        """Template tensors for an accel estimate (loaded once per model)."""
         if self._tensors is None:
-            from lephare.accel.mag_builder import build_maglib_from_prepare
-            from lephare.accel.maglib import load_maglib
-
-            maglib_path = self.model.get("maglib_path")
-            if maglib_path and os.path.isfile(maglib_path):
-                self._tensors = load_maglib(maglib_path)
-            else:
-                self._tensors = build_maglib_from_prepare(self.lephare_config)
+            self._tensors = self._load_accel_maglib()
         return self._tensors
+
+    def _load_accel_maglib(self):
+        """The informer's tensors, else the C++ lib_mag already in run_dir (e.g. a
+        C++-informed model), else a fresh ``lp.prepare``."""
+        from lephare.accel.mag_builder import build_maglib_from_prepare
+        from lephare.accel.maglib import export_maglib_from_photoz, load_maglib
+
+        maglib_path = self.model.get("maglib_path")
+        if maglib_path and os.path.isfile(maglib_path):
+            return load_maglib(maglib_path)
+        libs = [
+            s.strip()
+            for s in str(self.lephare_config.get("ZPHOTLIB", "")).split(",")
+            if s.strip()
+        ]
+        lib_files = [
+            os.path.join(self.run_dir, "lib_mag", f"{name}.bin") for name in libs
+        ]
+        if libs and all(os.path.isfile(f) for f in lib_files):
+            photz = lp.PhotoZ(lp.all_types_to_keymap(self.lephare_config))
+            return export_maglib_from_photoz(photz, self.lephare_config)
+        sub_configs = {
+            k: self.model[k]
+            for k in ("star_config", "gal_config", "qso_config")
+            if k in self.model
+        }
+        return build_maglib_from_prepare(self.lephare_config, **sub_configs)
 
 
 def _rail_to_lephare_input(data, mag_cols, mag_err_cols):

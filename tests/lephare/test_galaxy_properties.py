@@ -167,3 +167,66 @@ def test_jax_full_maglib_metadata_matches_cpp(test_data_dir, tmp_path):
     assert np.any(ref.ltir[g0] > 0)  # dust energy balance actually exercised
     for key in keys:  # every requested key is computed (NaN means "not provided")
         assert not np.all(np.isnan(np.asarray(ancil_j[key], dtype=np.float64))), key
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not jax_available(), reason="jax not installed")
+def test_accel_estimate_reuses_cpp_informed_library(test_data_dir, tmp_path):
+    """An accel estimate on a C++-informed model (no maglib_path) must read the
+    inform lib_mag, not rerun ``lp.prepare`` without the star/gal/qso sub-configs."""
+    import glob
+
+    keys = [
+        "Z_BEST",
+        "CHI_BEST",
+        "ZQ_BEST",
+        "CHI_QSO",
+        "MOD_STAR",
+        "CHI_STAR",
+        "MASS_MED",
+        "SFR_MED",
+    ]
+    overrides = _bc03_overrides(tmp_path)
+    para = tmp_path / "output_shared.para"
+    para.write_text("\n".join(["IDENT"] + keys) + "\n")
+    overrides["lephare.PARA_OUT"] = str(para)
+    train, test = _load_data(test_data_dir)
+    inform = LephareInformer.make_stage(
+        name="inform_phys_cpp_shared",
+        nondetect_val=np.nan,
+        model=str(tmp_path / "phys_cpp_shared.pkl"),
+        hdf5_groupname="",
+        zmin=0,
+        zmax=3,
+        nzbins=31,
+        backend="lephare",
+        **overrides,
+    )
+    inform.inform(train)
+    lib_mag = sorted(
+        glob.glob(os.path.join(inform.model["run_dir"], "lib_mag", "*.bin"))
+    )
+    mtimes = [os.path.getmtime(p) for p in lib_mag]
+    ancil = {}
+    for backend in ("lephare", "jax_hybrid"):
+        estimate = LephareEstimator.make_stage(
+            name=f"est_phys_cpp_shared_{backend}",
+            nondetect_val=np.nan,
+            model=inform.get_handle("model"),
+            hdf5_groupname="",
+            output=str(tmp_path / f"est_phys_cpp_shared_{backend}.hdf5"),
+            output_keys=keys,
+            backend=backend,
+            dtype="float64",
+        )
+        ancil[backend] = estimate.estimate(test).data.ancil
+    assert [os.path.getmtime(p) for p in lib_mag] == mtimes
+    for key in keys:
+        np.testing.assert_allclose(
+            np.asarray(ancil["jax_hybrid"][key], dtype=np.float64),
+            np.asarray(ancil["lephare"][key], dtype=np.float64),
+            rtol=1e-6,
+            atol=1e-6,
+            equal_nan=True,
+            err_msg=key,
+        )
