@@ -162,8 +162,7 @@ def test_jax_full_maglib_metadata_matches_cpp(test_data_dir, tmp_path):
             getattr(jx, field)[g1], getattr(ref, field)[g0], err_msg=field
         )
     np.testing.assert_array_equal(jx.index_z0[g1] - g1[0], ref.index_z0[g0] - g0[0])
-    # dust luminosity uses the Python extinction port (C++ 1.0 interpolates differently)
-    np.testing.assert_allclose(jx.ltir[g1], ref.ltir[g0], rtol=0, atol=1e-3)
+    np.testing.assert_allclose(jx.ltir[g1], ref.ltir[g0], rtol=1e-12, atol=1e-12)
     assert np.any(ref.ltir[g0] > 0)  # dust energy balance actually exercised
     for key in keys:  # every requested key is computed (NaN means "not provided")
         assert not np.all(np.isnan(np.asarray(ancil_j[key], dtype=np.float64))), key
@@ -281,3 +280,65 @@ def test_jax_fp32_galaxy_property_medians_match_cuda_fp32(test_data_dir, tmp_pat
             equal_nan=True,
             err_msg=key,
         )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    "backend",
+    [
+        pytest.param(
+            "jax_full",
+            marks=pytest.mark.skipif(not jax_available(), reason="jax not installed"),
+        ),
+        pytest.param(
+            "cuda_full",
+            marks=pytest.mark.skipif(
+                not cuda_available(), reason="cuda/cupy unavailable"
+            ),
+        ),
+    ],
+)
+def test_gpu_maggal_matches_cpp_library(test_data_dir, tmp_path, backend):
+    """GPU MagGal (inform on jax_full / cuda_full) reproduces the C++ magnitude library:
+    BC03 with dust on every model, emission lines, QSO and stars."""
+    from lephare.accel.maglib import export_maglib_from_photoz, load_maglib
+
+    from rail.estimation.algos.lephare import _update_lephare_env
+
+    overrides = _bc03_overrides(tmp_path)
+    train, test = _load_data(test_data_dir, n_test=5)
+    model_c, _ = _inform_and_estimate(
+        "lephare", overrides, train, test, ["Z_BEST"], tmp_path
+    )
+    _update_lephare_env(None, model_c["run_dir"])
+    ref = export_maglib_from_photoz(
+        lp.PhotoZ(lp.all_types_to_keymap(model_c["lephare_config"])),
+        model_c["lephare_config"],
+    )
+    model_g, _ = _inform_and_estimate(
+        backend, overrides, train, test, ["Z_BEST"], tmp_path
+    )
+    got = load_maglib(model_g["maglib_path"])
+    for typ in (0, 1, 2):
+        a, b = np.flatnonzero(ref.types == typ), np.flatnonzero(got.types == typ)
+        assert a.size == b.size, typ
+        np.testing.assert_allclose(
+            got.flux[b], ref.flux[a], rtol=1e-10, atol=0, err_msg=f"flux type {typ}"
+        )
+        np.testing.assert_allclose(
+            got.mag0[b], ref.mag0[a], rtol=0, atol=1e-10, err_msg=f"mag0 type {typ}"
+        )
+        np.testing.assert_array_equal(got.z[b], ref.z[a])
+        np.testing.assert_array_equal(got.nummod[b], ref.nummod[a])
+    g0, g1 = np.flatnonzero(ref.types == 0), np.flatnonzero(got.types == 0)
+    for field in ("ebv", "mass", "sfr", "ltir"):
+        np.testing.assert_allclose(
+            getattr(got, field)[g1],
+            getattr(ref, field)[g0],
+            rtol=1e-12,
+            atol=1e-12,
+            err_msg=field,
+        )
+    assert np.any(ref.ebv[g0] > 0) and np.any(
+        ref.ltir[g0] > 0
+    )  # dust actually exercised

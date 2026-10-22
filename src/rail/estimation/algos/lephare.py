@@ -269,7 +269,7 @@ class LephareInformer(CatInformer):
                 backend, self.lephare_config, star_config, gal_config, qso_config
             )
             maglib_path = os.path.join(self.run_dir, "maglib_tensors.npz")
-            save_maglib(tensors, maglib_path)
+            save_maglib(tensors, maglib_path, compressed=False)
         else:
             self.log.info(
                 f"do_prepare set to False, using precomputed files in {self.run_dir}."
@@ -714,32 +714,23 @@ def _rail_to_lephare_input(data, mag_cols, mag_err_cols):
 def _build_maglib(backend, lephare_config, star_config, gal_config, qso_config):
     """Build the template tensors for an accel backend.
 
-    ``*_hybrid`` and ``cuda_full`` run the classic ``lp.prepare`` first;
-    ``cuda_full`` then recomputes the magnitudes on the GPU and checks them
-    against C++. ``jax_full`` computes the magnitudes with JAX only.
+    ``*_hybrid`` runs the classic ``lp.prepare``. ``*_full`` runs the C++ filter and
+    sedtolib steps, then computes the magnitude library as one GEMM per wavelength
+    grid on the backend's device (same values as the C++ MagGal).
     """
     sub_configs = dict(
         star_config=star_config, gal_config=gal_config, qso_config=qso_config
     )
-    if backend == "jax_full":
+    if backend in ("jax_full", "cuda_full"):
         from lephare.accel.jax_maggal import build_maglib_jax_from_lib_bin
 
         return build_maglib_jax_from_lib_bin(
-            lephare_config, integrator="jax", **sub_configs
+            lephare_config, integrator="linear", device=backend, **sub_configs
         )
 
-    from lephare.accel.mag_builder import (
-        assert_maglib_parity,
-        build_maglib_from_prepare,
-        rebuild_maglib_cuda,
-    )
+    from lephare.accel.mag_builder import build_maglib_from_prepare
 
-    tensors = build_maglib_from_prepare(lephare_config, **sub_configs)
-    if backend == "cuda_full":
-        rebuilt = rebuild_maglib_cuda(tensors, config=lephare_config)
-        assert_maglib_parity(tensors, rebuilt)
-        tensors = rebuilt
-    return tensors
+    return build_maglib_from_prepare(lephare_config, **sub_configs)
 
 
 def _accel_offsets(
