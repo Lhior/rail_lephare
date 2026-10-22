@@ -1,5 +1,6 @@
 import importlib
 import os
+import warnings
 from typing import Any
 
 import lephare as lp
@@ -100,6 +101,28 @@ def _add_sub_config(
         config[f"{prefix}{key}"] = param
 
 
+def _warn_legacy_lephare_config(
+    config: StageConfig, lephare_config: dict[str, Any]
+) -> None:
+    """Warn that a ``lephare_config`` dict (pre ``lephare.KEY`` syntax) is ignored,
+    naming the keys whose values differ from the ones LePhare will actually use."""
+    legacy = config["lephare_config"] if "lephare_config" in config else None
+    if not legacy:
+        return
+    differ = sorted(
+        k
+        for k, v in dict(legacy).items()
+        if str(lephare_config.get(k, "")).strip() != str(v).strip()
+    )
+    warnings.warn(
+        f"{config['name']}: the 'lephare_config' parameter is ignored; set LePhare keywords "
+        f"as 'lephare.KEY' stage parameters instead. Keys whose ignored value differs from "
+        f"the one used: {', '.join(differ) if differ else 'none'}",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
 def _get_sub_config(config: StageConfig, prefix: str) -> dict[str, Any]:
     """Extract all config parameters that start with a
     particular prefix into a dict"""
@@ -161,6 +184,7 @@ class LephareInformer(CatInformer):
         # Extract the lephare sub-config only now, so that it contains the
         # redshift grid set above rather than the lephare default Z_STEP.
         self.lephare_config = _get_sub_config(self.config, "lephare.")
+        _warn_legacy_lephare_config(self.config, self.lephare_config)
         # We create a run directory with the informer name
         self.run_dir = _set_run_dir(self.config["name"])
 
