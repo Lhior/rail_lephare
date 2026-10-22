@@ -408,6 +408,18 @@ class LephareEstimator(CatEstimator):
                 return self.model["backend"]
         return backend
 
+    def _calculate_best_point_estimate(self, qp_dist, grid=None):
+        """RAIL ``zbest`` on the accelerated backend's device (same bounded Brent as
+        RAIL's per-object scipy loop, run for all objects at once)."""
+        if self._resolved_backend() == "lephare":
+            return super()._calculate_best_point_estimate(qp_dist, grid)
+        from lephare.accel.point_estimates import zbest_on_backend
+
+        if grid is None:
+            grid = np.linspace(self.config.zmin, self.config.zmax, self.config.nzbins)
+        grid = np.asarray(grid, dtype=np.float64)
+        return zbest_on_backend(qp_dist.pdf(grid), grid, self._resolved_backend())
+
     def run(self) -> None:
         """Estimate loop. Accel backends skip the per-chunk ``gc.collect`` (it stalls the GPU)."""
         if self.config["backend"] == "lephare":
@@ -589,7 +601,11 @@ class LephareEstimator(CatEstimator):
         """The informer's tensors, else the C++ lib_mag already in run_dir (e.g. a
         C++-informed model), else a fresh ``lp.prepare``."""
         from lephare.accel.mag_builder import build_maglib_from_prepare
-        from lephare.accel.maglib import export_maglib_from_photoz, load_maglib
+        from lephare.accel.maglib import (
+            export_maglib_from_photoz,
+            load_maglib,
+            save_maglib,
+        )
 
         maglib_path = self.model.get("maglib_path")
         if maglib_path and os.path.isfile(maglib_path):
@@ -603,14 +619,45 @@ class LephareEstimator(CatEstimator):
             os.path.join(self.run_dir, "lib_mag", f"{name}.bin") for name in libs
         ]
         if libs and all(os.path.isfile(f) for f in lib_files):
+            # Exporting the C++ lib_mag costs seconds per run; cache the dense tensors
+            # next to it, keyed by the config and the lib_mag files they came from.
+            cache = os.path.join(self.run_dir, "lib_mag", "accel_maglib_cache.npz")
+            sig = _maglib_cache_signature(self.lephare_config, lib_files)
+            sig_path = cache + ".sig"
+            if os.path.isfile(cache) and os.path.isfile(sig_path):
+                with open(sig_path, encoding="utf-8") as f:
+                    if f.read() == sig:
+                        return load_maglib(cache)
             photz = lp.PhotoZ(lp.all_types_to_keymap(self.lephare_config))
-            return export_maglib_from_photoz(photz, self.lephare_config)
+            tensors = export_maglib_from_photoz(photz, self.lephare_config)
+            try:
+                save_maglib(tensors, cache, compressed=False)
+                with open(sig_path, "w", encoding="utf-8") as f:
+                    f.write(sig)
+            except OSError:  # read-only run_dir: just skip the cache
+                pass
+            return tensors
         sub_configs = {
             k: self.model[k]
             for k in ("star_config", "gal_config", "qso_config")
             if k in self.model
         }
         return build_maglib_from_prepare(self.lephare_config, **sub_configs)
+
+
+def _maglib_cache_signature(lephare_config: dict, lib_files: list[str]) -> str:
+    """Hash of the config and the (size, mtime) of each lib_mag file."""
+    import hashlib
+    import json
+
+    files = [(f, os.path.getsize(f), os.stat(f).st_mtime_ns) for f in lib_files]
+    blob = json.dumps(
+        {
+            "config": sorted((str(k), str(v)) for k, v in lephare_config.items()),
+            "files": files,
+        }
+    )
+    return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def _rail_to_lephare_input(data, mag_cols, mag_err_cols):
