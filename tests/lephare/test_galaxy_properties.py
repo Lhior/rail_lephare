@@ -230,3 +230,54 @@ def test_accel_estimate_reuses_cpp_informed_library(test_data_dir, tmp_path):
             equal_nan=True,
             err_msg=key,
         )
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not (jax_available() and cuda_available()), reason="jax and cuda/cupy required"
+)
+def test_jax_fp32_galaxy_property_medians_match_cuda_fp32(test_data_dir, tmp_path):
+    """JAX FP32 posterior medians match the CUDA FP32 kernel (plain FP32 FMAs).
+
+    Guards against TF32 GEMMs in the JAX χ² (base - avmago²/avmagt cancels), which
+    shifted SFR_MED by up to ~7 dex. Both FP32 paths share the same flux scaling, so
+    they are compared to each other rather than to C++.
+    """
+    overrides = _bc03_overrides(tmp_path)
+    train, test = _load_data(test_data_dir, n_test=300)
+    keys = ["MASS_MED", "SFR_MED", "SSFR_MED", "AGE_MED"]
+    inform = LephareInformer.make_stage(
+        name="inform_phys_fp32",
+        nondetect_val=np.nan,
+        model=str(tmp_path / "phys_fp32.pkl"),
+        hdf5_groupname="",
+        zmin=0,
+        zmax=3,
+        nzbins=31,
+        backend="cuda_hybrid",
+        dtype="float32",
+        **overrides,
+    )
+    inform.inform(train)
+    ancil = {}
+    for backend in ("cuda_hybrid", "jax_hybrid"):
+        estimate = LephareEstimator.make_stage(
+            name=f"est_phys_fp32_{backend}",
+            nondetect_val=np.nan,
+            model=inform.get_handle("model"),
+            hdf5_groupname="",
+            output=str(tmp_path / f"est_phys_fp32_{backend}.hdf5"),
+            output_keys=keys,
+            backend=backend,
+            dtype="float32",
+        )
+        ancil[backend] = estimate.estimate(test).data.ancil
+    for key in keys:
+        np.testing.assert_allclose(
+            np.asarray(ancil["jax_hybrid"][key], dtype=np.float64),
+            np.asarray(ancil["cuda_hybrid"][key], dtype=np.float64),
+            rtol=0,
+            atol=0.01,
+            equal_nan=True,
+            err_msg=key,
+        )
