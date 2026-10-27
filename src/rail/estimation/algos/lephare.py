@@ -1,6 +1,9 @@
 import importlib
 import os
+import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from typing import Any
 
 import lephare as lp
@@ -389,6 +392,16 @@ class LephareEstimator(CatEstimator):
             msg="Whether to write the output files.",
         ),
         **_backend_params(),
+        async_output=Param(
+            bool,
+            True,
+            msg=(
+                "Accelerated backends: build and write each chunk's output (point "
+                "estimates, qp ensemble, HDF5 write) on a background thread while the "
+                "next chunk is fitted, so the GPU does not wait on disk. At most one "
+                "chunk is in flight; chunks are written in order."
+            ),
+        ),
     )
     _add_sub_config(config_options, lsst_default_config, "lephare.")
 
@@ -433,13 +446,51 @@ class LephareEstimator(CatEstimator):
         first = True
         self._initialize_run()
         self._output_handle = None
-        for s, e, test_data in iterator:
-            self.log.info(
-                f"Process {self.rank} running estimator on chunk {s:,} - {e:,}"
-            )
-            self._process_chunk(s, e, test_data, first)
-            first = False
+        self._output_wait_s = 0.0
+        if not self.config["async_output"]:
+            for s, e, test_data in iterator:
+                self.log.info(
+                    f"Process {self.rank} running estimator on chunk {s:,} - {e:,}"
+                )
+                self._process_chunk(s, e, test_data, first)
+                first = False
+            self._finalize_run()
+            return
+
+        # Fit chunk k+1 on the device while a single worker finishes chunk k
+        # (point estimates, qp ensemble, HDF5 write); one chunk in flight, in order.
+        pending = None
+        device = None
+        if self._resolved_backend().startswith("cuda"):
+            import cupy
+
+            device = cupy.cuda.Device()  # CuPy's current device is per thread
+
+        def finish(*args):
+            with device if device is not None else nullcontext():
+                self._finish_chunk_accel(*args)
+
+        with ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="lephare-output"
+        ) as pool:
+            for s, e, test_data in iterator:
+                self.log.info(
+                    f"Process {self.rank} running estimator on chunk {s:,} - {e:,}"
+                )
+                arrays = self._accel_estimate_arrays(test_data)
+                self._wait_output(pending)
+                pending = pool.submit(finish, s, e, test_data, first, *arrays)
+                first = False
+            self._wait_output(pending)
         self._finalize_run()
+
+    def _wait_output(self, pending) -> None:
+        """Block on the in-flight chunk write (re-raises its error); time the stall."""
+        if pending is None:
+            return
+        t0 = time.perf_counter()
+        pending.result()
+        self._output_wait_s += time.perf_counter() - t0
 
     def open_model(self, **kwargs):
         CatEstimator.open_model(self, **kwargs)
@@ -520,6 +571,11 @@ class LephareEstimator(CatEstimator):
 
     def _process_chunk_accel(self, start, end, data, first):
         """Process a chunk with a ``lephare.accel`` backend (BAY_ZG posterior only)."""
+        arrays = self._accel_estimate_arrays(data)
+        self._finish_chunk_accel(start, end, data, first, *arrays)
+
+    def _accel_estimate_arrays(self, data):
+        """Fit one chunk on the device: ``(pdfs, zgrid, zmode, zmean, ancil)``."""
         from lephare.accel.dispatch import process_with_backend
         from lephare.accel.kernels_ref import pdf_zmode_zmean
 
@@ -584,8 +640,6 @@ class LephareEstimator(CatEstimator):
                     dtype=np_dtype,
                 )
             )
-        self.zgrid = zgrid
-
         ng = mags.shape[0]
         ancil = dict(zmode=zmode, zmean=zmean)
         for c in output_keys:
@@ -593,6 +647,13 @@ class LephareEstimator(CatEstimator):
                 ancil[c] = np.asarray(backend_ancil[c], dtype=np.float64)
             else:
                 ancil[c] = np.full(ng, np.nan)
+        return pdfs, zgrid, zmode, zmean, ancil
+
+    def _finish_chunk_accel(
+        self, start, end, data, first, pdfs, zgrid, zmode, zmean, ancil
+    ):
+        """qp ensemble + point estimates + chunk write for one fitted chunk."""
+        self.zgrid = zgrid
         # PDFs are already normalized on the device
         qp_dstn = qp.Ensemble(
             qp.interp,
