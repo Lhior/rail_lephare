@@ -418,7 +418,9 @@ class LephareEstimator(CatEstimator):
         if grid is None:
             grid = np.linspace(self.config.zmin, self.config.zmax, self.config.nzbins)
         grid = np.asarray(grid, dtype=np.float64)
-        return zbest_on_backend(qp_dist.pdf(grid), grid, self._resolved_backend())
+        return zbest_on_backend(
+            _pdf_on_grid(qp_dist, grid), grid, self._resolved_backend()
+        )
 
     def run(self) -> None:
         """Estimate loop. Accel backends skip the per-chunk ``gc.collect`` (it stalls the GPU)."""
@@ -643,6 +645,22 @@ class LephareEstimator(CatEstimator):
             if k in self.model
         }
         return build_maglib_from_prepare(self.lephare_config, **sub_configs)
+
+
+def _pdf_on_grid(qp_dist, grid: np.ndarray) -> np.ndarray:
+    """``qp_dist.pdf(grid)``; an interp ensemble already on ``grid`` (to 1e-12) returns its
+    stored ``yvals`` (what its linear interpolation gives at the nodes) without the
+    per-row scipy interpolation, which costs as much as the GPU fit for large chunks."""
+    data = qp_dist.objdata
+    xvals = np.asarray(qp_dist.metadata.get("xvals", [np.nan])).ravel()
+    yvals = data.get("yvals") if hasattr(data, "get") else None
+    if (
+        yvals is not None
+        and xvals.shape == grid.shape
+        and np.allclose(xvals, grid, rtol=0.0, atol=1e-12)
+    ):
+        return np.asarray(yvals, dtype=np.float64)
+    return qp_dist.pdf(grid)
 
 
 def _maglib_cache_signature(lephare_config: dict, lib_files: list[str]) -> str:
