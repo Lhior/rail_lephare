@@ -540,15 +540,23 @@ class LephareEstimator(CatEstimator):
         tensors = self._accel_tensors()
         context = data["context"] if "context" in data else None
         np_dtype = np.float64 if dtype_name == "float64" else np.float32
-        result = process_with_backend(
-            backend,
-            mags,
-            magerrs,
+        from lephare.accel.physical import fused_galaxy_properties
+
+        # CUDA: accumulate the galaxy-property histograms inside the fit's GAL sweep
+        with fused_galaxy_properties(
+            list(self.config["output_keys"]) if backend.startswith("cuda") else [],
             tensors,
-            context=context,
-            offsets=offsets,
-            dtype=np_dtype,
-        )
+            self.lephare_config,
+        ):
+            result = process_with_backend(
+                backend,
+                mags,
+                magerrs,
+                tensors,
+                context=context,
+                offsets=offsets,
+                dtype=np_dtype,
+            )
         # Backends return (pdfs, zgrid[, zmode, zmean[, ancil]])
         pdfs, zgrid = result[0], result[1]
         if len(result) >= 4:
