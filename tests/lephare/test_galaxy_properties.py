@@ -8,12 +8,13 @@ import lephare as lp
 import numpy as np
 import pytest
 import tables_io
-from lephare.accel.dispatch import cuda_available, jax_available
-from lephare.accel.physical import (
-    GALAXY_PROPERTY_KEYS,
-)
 
 from rail.estimation.algos.lephare import LephareEstimator, LephareInformer
+
+pytest.importorskip("lephare.accel", reason="lephare without lephare.accel")
+# pylint: disable=wrong-import-position
+from lephare.accel.dispatch import cuda_available, jax_available  # noqa: E402
+from lephare.accel.physical import GALAXY_PROPERTY_KEYS  # noqa: E402
 
 
 def _bc03_overrides(tmp_path) -> dict:

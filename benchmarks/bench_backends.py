@@ -1,12 +1,8 @@
 #!/usr/bin/env python
 """Accuracy-gated + max-batch throughput benchmarks for LePHARE backends.
 
-Usage:
-  export OMP_NUM_THREADS=20
-  export OPENBLAS_NUM_THREADS=20
-  export MKL_NUM_THREADS=20
-  export NUMEXPR_NUM_THREADS=20
-  export JAX_PLATFORMS=cuda,cpu
+Usage (set the thread count to the cores you want the C++ baseline to use):
+  export OMP_NUM_THREADS=<n_cores>
   export JAX_ENABLE_X64=1
   pip install -e '.[jax,cuda]'
   python benchmarks/bench_backends.py
@@ -20,11 +16,6 @@ import threading
 import time
 from pathlib import Path
 
-os.environ.setdefault("OMP_NUM_THREADS", "20")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "20")
-os.environ.setdefault("MKL_NUM_THREADS", "20")
-os.environ.setdefault("NUMEXPR_NUM_THREADS", "20")
-os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
 os.environ.setdefault("JAX_ENABLE_X64", "1")
 
 import lephare as lp
@@ -51,7 +42,11 @@ def _device_info():
         import cupy as cp
 
         props = cp.cuda.runtime.getDeviceProperties(0)
-        name = props["name"].decode() if isinstance(props["name"], bytes) else props["name"]
+        name = (
+            props["name"].decode()
+            if isinstance(props["name"], bytes)
+            else props["name"]
+        )
         info["cuda"] = name
     except Exception as exc:
         info["cuda"] = f"unavailable ({exc})"
@@ -80,7 +75,12 @@ class GpuUtilSampler:
         if self._thread is not None:
             self._thread.join(timeout=5)
         if not self.utils:
-            return {"mean_util": 0.0, "peak_util": 0.0, "peak_mem_mib": 0.0, "nsamples": 0}
+            return {
+                "mean_util": 0.0,
+                "peak_util": 0.0,
+                "peak_mem_mib": 0.0,
+                "nsamples": 0,
+            }
         return {
             "mean_util": float(np.mean(self.utils)),
             "peak_util": float(np.max(self.utils)),
@@ -91,14 +91,18 @@ class GpuUtilSampler:
     def _run(self):
         while not self._stop.is_set():
             try:
-                out = subprocess.check_output(
-                    [
-                        "nvidia-smi",
-                        "--query-gpu=utilization.gpu,memory.used",
-                        "--format=csv,noheader,nounits",
-                    ],
-                    text=True,
-                ).strip().splitlines()[0]
+                out = (
+                    subprocess.check_output(
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=utilization.gpu,memory.used",
+                            "--format=csv,noheader,nounits",
+                        ],
+                        text=True,
+                    )
+                    .strip()
+                    .splitlines()[0]
+                )
                 util_s, mem_s = [p.strip() for p in out.split(",")]
                 self.utils.append(float(util_s))
                 self.mems.append(float(mem_s))
@@ -260,9 +264,10 @@ def _ensure_model(backend, dtype, models, cfg, train):
 
 def _run_throughput(backends, cfg, train, test, parity_rows):
     """Short VRAM-saturation probe (one GPU-sized tile)."""
-    from rail.estimation.algos.lephare import LephareEstimator
     from lephare.accel.gpu_util import suggest_chi2_chunk_size
     from lephare.accel.maglib import load_maglib
+
+    from rail.estimation.algos.lephare import LephareEstimator
 
     print("\n=== Throughput probe (one GPU-sized tile) ===")
     models = _collect_models(parity_rows)
@@ -678,13 +683,20 @@ def main(argv: list[str] | None = None):
     thr = []
     if not args.skip_probe:
         thr = _run_throughput(backends, cfg, train, test, parity)
-        lep = next((r for r in thr if r["backend"] == "lephare" and r["dtype"] == "float64"), None)
+        lep = next(
+            (r for r in thr if r["backend"] == "lephare" and r["dtype"] == "float64"),
+            None,
+        )
         print("\nThroughput speedup vs lephare FP64 (same n_obj for FP64 rows):")
         if lep:
             for r in thr:
                 if r["backend"] == "lephare":
                     continue
-                if r["dtype"] == "float64" and r["n_obj"] == lep["n_obj"] and r["t_estimate"] > 0:
+                if (
+                    r["dtype"] == "float64"
+                    and r["n_obj"] == lep["n_obj"]
+                    and r["t_estimate"] > 0
+                ):
                     print(
                         f"  {r['backend']:12s} FP64  "
                         f"speedup={lep['t_estimate'] / r['t_estimate']:.2f}x  "

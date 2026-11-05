@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import qp
+
+pytest.importorskip("lephare.accel", reason="lephare without lephare.accel")
 
 
 def _rail_zbest(pdf_vals: np.ndarray, grid: np.ndarray) -> np.ndarray:

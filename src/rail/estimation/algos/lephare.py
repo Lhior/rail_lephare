@@ -1,7 +1,8 @@
+import hashlib
 import importlib
+import json
 import os
 import time
-import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import Any
@@ -128,28 +129,6 @@ def _add_sub_config(
         config[f"{prefix}{key}"] = param
 
 
-def _warn_legacy_lephare_config(
-    config: StageConfig, lephare_config: dict[str, Any]
-) -> None:
-    """Warn that a ``lephare_config`` dict (pre ``lephare.KEY`` syntax) is ignored,
-    naming the keys whose values differ from the ones LePhare will actually use."""
-    legacy = config["lephare_config"] if "lephare_config" in config else None
-    if not legacy:
-        return
-    differ = sorted(
-        k
-        for k, v in dict(legacy).items()
-        if str(lephare_config.get(k, "")).strip() != str(v).strip()
-    )
-    warnings.warn(
-        f"{config['name']}: the 'lephare_config' parameter is ignored; set LePhare keywords "
-        f"as 'lephare.KEY' stage parameters instead. Keys whose ignored value differs from "
-        f"the one used: {', '.join(differ) if differ else 'none'}",
-        UserWarning,
-        stacklevel=2,
-    )
-
-
 def _get_sub_config(config: StageConfig, prefix: str) -> dict[str, Any]:
     """Extract all config parameters that start with a
     particular prefix into a dict"""
@@ -217,7 +196,6 @@ class LephareInformer(CatInformer):
         # Extract the lephare sub-config only now, so that it contains the
         # redshift grid set above rather than the lephare default Z_STEP.
         self.lephare_config = _get_sub_config(self.config, "lephare.")
-        _warn_legacy_lephare_config(self.config, self.lephare_config)
         # We create a run directory with the informer name
         self.run_dir = _set_run_dir(self.config["name"])
 
@@ -499,10 +477,11 @@ class LephareEstimator(CatEstimator):
             self.lephare_config = self.model["lephare_config"]
         else:
             self.lephare_config = _get_sub_config(self.config, "lephare.")
-        # String values, in case a keymap was passed to the estimate stage
-        self.lephare_config = lp.keymap_to_string_dict(
-            lp.all_types_to_keymap(self.lephare_config)
-        )
+        if self._resolved_backend() != "lephare":
+            # lephare.accel reads string values, in case a keymap was passed
+            self.lephare_config = lp.keymap_to_string_dict(
+                lp.all_types_to_keymap(self.lephare_config)
+            )
 
         Z_STEP = self.model["lephare_config"]["Z_STEP"]
         self.lephare_config["Z_STEP"] = Z_STEP
@@ -734,9 +713,6 @@ def _pdf_on_grid(qp_dist, grid: np.ndarray) -> np.ndarray:
 
 def _maglib_cache_signature(lephare_config: dict, lib_files: list[str]) -> str:
     """Hash of the config and the (size, mtime) of each lib_mag file."""
-    import hashlib
-    import json
-
     files = [(f, os.path.getsize(f), os.stat(f).st_mtime_ns) for f in lib_files]
     blob = json.dumps(
         {

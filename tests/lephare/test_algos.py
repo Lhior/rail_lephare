@@ -94,24 +94,3 @@ def test_informer_and_estimator(test_data_dir: str):
     assert np.isclose(
         np.sum(lephare_estimated.data[0].pdf(np.linspace(0, 3, 300))), 99.66482986408954
     )
-
-
-def test_informer_warns_on_ignored_lephare_config():
-    """The pre ``lephare.KEY`` dict is silently dropped by validate(); say so."""
-    inform_lephare = LephareInformer.make_stage(
-        name="inform_Lephare_legacy",
-        nondetect_val=np.nan,
-        model="lephare.pkl",
-        hdf5_groupname="",
-        lephare_config={"SEL_AGE": "AGE_BC03COMB.dat", "CAT_IN": "undefined"},
-    )
-    with pytest.warns(UserWarning, match=r"'lephare_config' parameter is ignored.*SEL_AGE") as rec:
-        inform_lephare.validate()
-    assert "CAT_IN" not in str(rec[0].message)  # same value as the one used
-
-
-def test_informer_no_warning_without_lephare_config(recwarn):
-    LephareInformer.make_stage(
-        name="inform_Lephare_plain", nondetect_val=np.nan, model="lephare.pkl", hdf5_groupname=""
-    ).validate()
-    assert not [w for w in recwarn if "lephare_config" in str(w.message)]

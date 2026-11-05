@@ -1,14 +1,29 @@
 """RAIL-side batching: PDF evaluation on the stored grid and asynchronous chunk output."""
 
+import os
+
+import h5py
 import numpy as np
 import pytest
+import qp
+import tables_io
+
+from rail.estimation.algos.lephare import (
+    LephareEstimator,
+    LephareInformer,
+    _pdf_on_grid,
+)
+
+
+def _cuda_available() -> bool:
+    try:
+        from lephare.accel.dispatch import cuda_available
+    except ImportError:  # lephare without lephare.accel
+        return False
+    return cuda_available()
 
 
 def test_pdf_on_grid_matches_qp():
-    import qp
-
-    from rail.estimation.algos.lephare import _pdf_on_grid
-
     z = np.arange(301) * 0.01
     y = np.random.default_rng(0).random((20, 301))
     ens = qp.Ensemble(qp.interp, data=dict(xvals=z, yvals=y, norm=False, warn=False))
@@ -21,19 +36,9 @@ def test_pdf_on_grid_matches_qp():
     np.testing.assert_array_equal(_pdf_on_grid(ens, off), ens.pdf(off))
 
 
-@pytest.mark.skipif(
-    not __import__("lephare.accel.dispatch", fromlist=["x"]).cuda_available(),
-    reason="cuda/cupy unavailable",
-)
+@pytest.mark.skipif(not _cuda_available(), reason="cuda/cupy unavailable")
 def test_async_output_matches_sync(test_data_dir, tmp_path):
     """Writing chunk k on the output thread while chunk k+1 is fitted gives the same file."""
-    import os
-
-    import h5py
-    import tables_io
-
-    from rail.estimation.algos.lephare import LephareEstimator, LephareInformer
-
     train = tables_io.read(os.path.join(test_data_dir, "output_table_conv_train.hdf5"))
     test = tables_io.read(os.path.join(test_data_dir, "output_table_conv_test.hdf5"))
     inform = LephareInformer.make_stage(

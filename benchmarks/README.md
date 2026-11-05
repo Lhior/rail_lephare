@@ -6,8 +6,7 @@ Accuracy-gated wall-time comparison plus GPU throughput with utilization samplin
 
 ```bash
 cd rail_lephare  # lephare must include lephare.accel
-export OMP_NUM_THREADS=20
-export JAX_PLATFORMS=cuda,cpu
+export OMP_NUM_THREADS=<n_cores>  # threads for the C++ baseline
 export JAX_ENABLE_X64=1
 export CUDA_VISIBLE_DEVICES=0
 pip install -e '.[jax,cuda]'
